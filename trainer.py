@@ -1,5 +1,6 @@
 import torch.optim as optim
 import math
+import torch
 import util
 class Trainer():
     def __init__(self, model, lrate, wdecay, clip, step_size, seq_out_len, scaler, device, cl=True):
