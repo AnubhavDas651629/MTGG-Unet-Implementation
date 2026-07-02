@@ -1,61 +1,124 @@
-import torch.optim as optim
-import math
+"""
+Trainer for UNet-MTGNN Tornado Forecasting.
+
+Handles training, validation, and loss computation for the hybrid model
+that predicts spatial tornado probability maps from temporal weather sequences.
+
+Loss: Weighted BCEWithLogitsLoss (same as the original Weather-Forecasting-Unet project)
+Validation metric: KL divergence between predicted and hindcast probabilities
+"""
+
 import torch
-import util
-class Trainer():
-    def __init__(self, model, lrate, wdecay, clip, step_size, seq_out_len, scaler, device, cl=True):
-        self.scaler = scaler
+import torch.nn as nn
+import torch.optim as optim
+import torch.nn.functional as F
+import math
+
+
+def bernoulli_entropy(p, eps=1e-7):
+    """H(p) = -p*log(p) - (1-p)*log(1-p), safe for p in {0, 1}."""
+    p = p.clamp(eps, 1.0 - eps)
+    return -(p * p.log() + (1.0 - p) * (1.0 - p).log())
+
+
+def kl_divergence_from_logits(logits, target, eps=1e-7):
+    """
+    Numerically stable KL(target || pred) for Bernoulli distributions.
+    Uses the identity: KL(p || q) = BCE(p, q) - H(p)
+    """
+    bce = F.binary_cross_entropy_with_logits(logits, target, reduction="mean")
+    h_target = bernoulli_entropy(target, eps).mean()
+    return bce - h_target
+
+
+class Trainer:
+    """
+    Training engine for the UNet-MTGNN hybrid model.
+
+    Args:
+        model:      UNetMTGNN model instance
+        lrate:      Learning rate for Adam optimizer
+        wdecay:     Weight decay (L2 regularization)
+        clip:       Gradient clipping max norm (None to disable)
+        device:     'cpu' or 'cuda'
+        pos_weight: Positive class weight for BCEWithLogitsLoss (tornado events
+                    are rare, so we upweight them). Default 10.0.
+    """
+
+    def __init__(self, model, lrate, wdecay, clip, device, pos_weight=10.0):
         self.model = model
         self.model.to(device)
-        self.optimizer = optim.Adam(self.model.parameters(), lr=lrate, weight_decay=wdecay)
-        self.loss = util.masked_mae
+        self.device = device
         self.clip = clip
-        self.step = step_size
-        self.iter = 1
-        self.task_level = 1
-        self.seq_out_len = seq_out_len
-        self.cl = cl
 
-    def train(self, input, real_val, idx=None):
+        self.optimizer = optim.Adam(
+            self.model.parameters(), lr=lrate, weight_decay=wdecay
+        )
+
+        # Weighted BCE loss — tornado events are extremely rare (class imbalance)
+        # pos_weight > 1 makes the model pay more attention to tornado-positive pixels
+        self.loss_fn = nn.BCEWithLogitsLoss(
+            pos_weight=torch.tensor([pos_weight]).to(device)
+        )
+
+    def train(self, input_seq, target_seq):
+        """
+        Run one training step.
+
+        Args:
+            input_seq:  (B, seq_in, 3, H, W) — input weather map sequence
+            target_seq: (B, seq_out, 2, H, W) — target tornado probability maps
+
+        Returns:
+            (loss, kl_div) — training loss and KL divergence for this batch
+        """
         self.model.train()
         self.optimizer.zero_grad()
-        output = self.model(input, idx=idx)
-        output = output.transpose(1,3)
-        real = torch.unsqueeze(real_val,dim=1)
-        predict = self.scaler.inverse_transform(output)
-        if self.iter%self.step==0 and self.task_level<=self.seq_out_len:
-            self.task_level +=1
-        if self.cl:
-            loss = self.loss(predict[:, :, :, :self.task_level], real[:, :, :, :self.task_level], 0.0)
-        else:
-            loss = self.loss(predict, real, 0.0)
 
+        # Forward pass: model outputs raw logits (B, seq_out, 2, H, W)
+        logits = self.model(input_seq)
+
+        # Compute BCE loss
+        loss = self.loss_fn(logits, target_seq)
+
+        # Backward pass
         loss.backward()
 
+        # Gradient clipping
         if self.clip is not None:
             torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.clip)
 
         self.optimizer.step()
-        # mae = util.masked_mae(predict,real,0.0).item()
-        mape = util.masked_mape(predict,real,0.0).item()
-        rmse = util.masked_rmse(predict,real,0.0).item()
-        self.iter += 1
-        return loss.item(),mape,rmse
 
-    def eval(self, input, real_val):
+        # Compute KL divergence for monitoring (detached, no gradients)
+        with torch.no_grad():
+            kl = kl_divergence_from_logits(logits, target_seq).item()
+
+        return loss.item(), kl
+
+    def eval(self, input_seq, target_seq):
+        """
+        Run one evaluation step (no gradient computation).
+
+        Args:
+            input_seq:  (B, seq_in, 3, H, W)
+            target_seq: (B, seq_out, 2, H, W)
+
+        Returns:
+            (loss, kl_div) — validation loss and KL divergence for this batch
+        """
         self.model.eval()
-        output = self.model(input)
-        output = output.transpose(1,3)
-        real = torch.unsqueeze(real_val,dim=1)
-        predict = self.scaler.inverse_transform(output)
-        loss = self.loss(predict, real, 0.0)
-        mape = util.masked_mape(predict,real,0.0).item()
-        rmse = util.masked_rmse(predict,real,0.0).item()
-        return loss.item(),mape,rmse
 
+        with torch.no_grad():
+            logits = self.model(input_seq)
+            loss = self.loss_fn(logits, target_seq)
+            kl = kl_divergence_from_logits(logits, target_seq).item()
+
+        return loss.item(), kl
 
 
 class Optim(object):
+    """Generic optimizer wrapper with learning rate decay."""
 
     def _makeOptimizer(self):
         if self.method == 'sgd':
@@ -87,18 +150,6 @@ class Optim(object):
         if self.clip is not None:
             torch.nn.utils.clip_grad_norm_(self.params, self.clip)
 
-        # for param in self.params:
-        #     grad_norm += math.pow(param.grad.data.norm(), 2)
-        #
-        # grad_norm = math.sqrt(grad_norm)
-        # if grad_norm > 0:
-        #     shrinkage = self.max_grad_norm / grad_norm
-        # else:
-        #     shrinkage = 1.
-        #
-        # for param in self.params:
-        #     if shrinkage < 1:
-        #         param.grad.data.mul_(shrinkage)
         self.optimizer.step()
         return  grad_norm
 
