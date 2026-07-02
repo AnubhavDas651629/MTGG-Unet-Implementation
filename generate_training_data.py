@@ -68,6 +68,35 @@ def generate_train_val_test(args):
 
     x_test, y_test = x[-num_test:], y[-num_test:]
 
-    
+    for cat in ["train", "val", "test"]:
+        _x, _y = locals()["x_" + cat], locals()["y_" + cat]
+        print(cat, "x: ", _x.shape, "y:", _y.shape)
+        np.savez_compressed(
+            os.path.join(args.output_dir, "%s.npz" % cat),
+            x=_x,
+            y=_y,
+            x_offsets=x_offsets.reshape(list(x_offsets.shape) + [1]),
+            y_offsets=y_offsets.reshape(list(y_offsets.shape) + [1]),
+        )
+
+
+def main(args):
+    print("Generating training data")
+    generate_train_val_test(args)
+
+
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser()
+    parser.add_argument(
+        "--output_dir", type=str, default="data/", help="Output directory."
+    )
+    parser.add_argument(
+        "--traffic_df_filename",
+        type=str,
+        default="data/metr-la.h5",
+        help="Raw traffic readings.",
+    )
+    args = parser.parse_args()
+    main(args)
 
 
